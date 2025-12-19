@@ -37,11 +37,12 @@ Bible_Study/
 ├── app.py
 ├── .env
 ├── bible.index
-└── chunks.npy
+└── chunks.npy ```
+
+
 ⚙️ Setup & Run
 1️⃣ Add API key
 Create a .env file:
-
 env
 Copy code
 GEMINI_API_KEY=your_api_key_here
@@ -57,12 +58,6 @@ python ingest.py
 bash
 Copy code
 streamlit run app.py
-💬 Example Questions
-Who is Abraham?
-
-Explain Jeremiah 29:11
-
-Meaning of Romans 8:1
 
 👤 Author
 Steff
@@ -71,3 +66,4 @@ AI & Generative AI Enthusiast
 📜 License
 Uses public-domain Bible and commentary texts.
 Provided for educational and research purposes.
+
