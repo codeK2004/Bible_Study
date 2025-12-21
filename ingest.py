@@ -1,68 +1,67 @@
-import os
-import faiss
 import numpy as np
-from dotenv import load_dotenv
-from PyPDF2 import PdfReader
+import faiss
 from sentence_transformers import SentenceTransformer
+from PyPDF2 import PdfReader
+from bible_parser import parse_bible
 
-# Load environment
-load_dotenv()
-
-# Load local embedding model (NO API)
-model = SentenceTransformer("all-MiniLM-L6-v2")
-
-# ---------- PDF LOADER ----------
+# ---------------- PDF LOADER ----------------
 def load_pdf(path):
     reader = PdfReader(path)
-
-    if reader.is_encrypted:
-        reader.decrypt("")
-
     text = ""
     for page in reader.pages:
-        page_text = page.extract_text()
-        if page_text:
-            text += page_text + "\n"
-
-    if not text.strip():
-        raise RuntimeError(f"No extractable text in {path}")
-
+        if page.extract_text():
+            text += page.extract_text() + "\n"
     return text
 
+# ---------------- CANONICAL BOOK NORMALIZER ----------------
+def canonical_book(book: str) -> str:
+    book = book.lower().strip()
 
-print("Loading Bible PDF...")
-bible_text = load_pdf("data/bible.pdf")
-print("Bible loaded.")
+    if book in ["psalm", "psalms"]:
+        return "psalms"
 
-print("Loading Commentary PDF...")
-commentary_text = load_pdf("data/commentary.pdf")
-print("Commentary loaded.")
+    # strip common prefixes
+    book = book.replace("the gospel according to", "").strip()
+    book = book.replace("st.", "").strip()
+    book = book.replace("saint", "").strip()
 
-combined_text = bible_text + "\n\n" + commentary_text
+    return book
 
-# ---------- CHUNK ----------
-def chunk_text(text, size=500):
-    chunks = []
-    i = 0
-    while i < len(text):
-        chunks.append(text[i:i + size])
-        i += size
-    return chunks
+# ---------------- MAIN ----------------
+def main():
+    print("📖 Loading Bible PDF...")
+    raw = load_pdf("data/bible.pdf")
 
-chunks = chunk_text(combined_text)
-print("Chunks:", len(chunks))
+    print("🧠 Parsing Bible...")
+    verses = parse_bible(raw)
 
-# ---------- EMBEDDINGS (LOCAL) ----------
-vectors = model.encode(chunks, show_progress_bar=True)
-vectors = np.array(vectors).astype("float32")
+    bible_chunks = []
+    for v in verses:
+        book = canonical_book(v["book"])
+        bible_chunks.append(
+            f"{book}|{v['chapter']}|{v['verse']}|{v['text']}"
+        )
 
-# ---------- FAISS ----------
-index = faiss.IndexFlatIP(vectors.shape[1])
-faiss.normalize_L2(vectors)
-index.add(vectors)
+    print(f"✅ Parsed {len(bible_chunks)} verses")
 
+    print("🔢 Creating embeddings...")
+    model = SentenceTransformer("all-MiniLM-L6-v2")
+    embeddings = model.encode(
+        bible_chunks,
+        batch_size=64,
+        show_progress_bar=True
+    )
 
-faiss.write_index(index, "bible.index")
-np.save("chunks.npy", chunks)
+    embeddings = np.array(embeddings).astype("float32")
 
-print("✅ FAISS index created successfully.")
+    print("📦 Building FAISS index...")
+    index = faiss.IndexFlatL2(embeddings.shape[1])
+    index.add(embeddings)
+
+    faiss.write_index(index, "bible.index")
+    np.save("bible_chunks.npy", np.array(bible_chunks, dtype=object))
+
+    print("🎉 Ingestion complete")
+
+if __name__ == "__main__":
+    main()

@@ -1,146 +1,155 @@
+import streamlit as st
+st.set_page_config(page_title="Bible Study Assistant", layout="centered")
+
 import os
 import re
 import faiss
 import numpy as np
-import streamlit as st
-from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
+from dotenv import load_dotenv
 from google import genai
 
-# ---------------- ENV SETUP ----------------
+# ---------------- ENV ----------------
 load_dotenv()
 API_KEY = os.getenv("GEMINI_API_KEY")
 
-client = genai.Client(api_key=API_KEY) if API_KEY else None
+client = None
+if API_KEY:
+    try:
+        client = genai.Client(api_key=API_KEY)
+    except Exception:
+        client = None
 
-# ---------------- LOAD MODELS & DATA ----------------
-embedder = SentenceTransformer("all-MiniLM-L6-v2")
+# ---------------- LOAD DATA ----------------
+@st.cache_resource
+def load_embedder():
+    return SentenceTransformer("all-MiniLM-L6-v2")
 
-index = faiss.read_index("bible.index")
-chunks = np.load("chunks.npy", allow_pickle=True)
+@st.cache_resource
+def load_index():
+    return faiss.read_index("bible.index")
 
-# ---------------- RETRIEVAL ----------------
-def retrieve(query, k=8):
-    query = query.strip().lower()
-    q_vec = embedder.encode([query])
-    q_vec = np.array(q_vec).astype("float32")
-    faiss.normalize_L2(q_vec)
+@st.cache_resource
+def load_chunks():
+    return np.load("bible_chunks.npy", allow_pickle=True)
 
-    _, idx = index.search(q_vec, k)
-    return [chunks[i] for i in idx[0]]
+embedder = load_embedder()
+index = load_index()
+bible_chunks = load_chunks()
 
-# ---------------- VERSE EXTRACTION (FIXED & CLEAN) ----------------
-def extract_verses(chunks, limit=8):
-    verses = []
-    current_ref = None
-    current_text = ""
+# ---------------- HELPERS ----------------
+def parse_chunk(chunk):
+    parts = chunk.split("|", 3)
+    if len(parts) != 4:
+        return None
+    book, chapter, verse, text = parts
+    return book, int(chapter), int(verse), text
 
-    for chunk in chunks:
-        for raw_line in chunk.split("\n"):
-            line = raw_line.strip()
-            if not line:
-                continue
+def normalize_book(book: str) -> str:
+    return book.lower().strip()
 
-            # Detect verse start: {106:1} OR 106:1
-            match = re.search(r"\{?(\d+:\d+)\}?", line)
+# ---------------- BOOK DETECTION ----------------
+BOOKS = [
+    "genesis","exodus","leviticus","numbers","deuteronomy",
+    "psalms","matthew","mark","luke","john","acts","romans"
+]
 
-            if match:
-                # Save previous verse
-                if current_ref and current_text:
-                    verses.append(f"**{current_ref}** — {current_text.strip()}")
-                    if len(verses) >= limit:
-                        return verses
+def detect_book_chapter(question):
+    q = question.lower()
+    for book in BOOKS:
+        m = re.search(rf"{book}\s+(\d+)", q)
+        if m:
+            return book, int(m.group(1))
+    return None, None
 
-                # Start new verse
-                current_ref = match.group(1)
-                current_text = re.sub(r"\{?\d+:\d+\}?", "", line).strip()
+# ---------------- SEARCH ----------------
+def semantic_search(query, k=5):
+    vec = embedder.encode([query]).astype("float32")
+    faiss.normalize_L2(vec)
+    _, idx = index.search(vec, k)
+    return [bible_chunks[i] for i in idx[0]]
 
-            else:
-                # Continue verse text
-                if current_ref:
-                    current_text += " " + line
+def get_chapter(book, chapter):
+    results = []
+    for chunk in bible_chunks:
+        parsed = parse_chunk(chunk)
+        if not parsed:
+            continue
+        b, c, v, text = parsed
+        if normalize_book(b) == book and c == chapter:
+            results.append(f"{b.title()} {c}:{v} {text}")
+    return results
 
-        if len(verses) >= limit:
-            break
-
-    # Add final verse
-    if current_ref and current_text and len(verses) < limit:
-        verses.append(f"**{current_ref}** — {current_text.strip()}")
-
-    return verses
-
-# ---------------- GEMINI (CACHED) ----------------
-@st.cache_data(show_spinner=False)
-def cached_llm_answer(question, context):
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=f"""
-You are a Bible study assistant.
-
-You may:
-- Explain Bible verses
-- Summarize biblical teaching
-- Use commentary for interpretation
-
-Rules:
-- Do NOT use modern opinions
-- Do NOT use outside sources
-- Stay faithful to Scripture
-
-Context:
-{context}
-
-Question:
-{question}
-"""
-    )
-    return response.text
+# ---------------- GEMINI (OPTIONAL) ----------------
+def gemini_answer(prompt):
+    if not client:
+        return None
+    try:
+        return client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt
+        ).text
+    except Exception:
+        return None
 
 # ---------------- ANSWER LOGIC ----------------
-def answer_question(question, mode):
-    retrieved_chunks = retrieve(question)
-    verses = extract_verses(retrieved_chunks)
-    context = "\n".join(retrieved_chunks)
+def answer(question, mode):
+    book, chapter = detect_book_chapter(question)
 
-    # Scripture-only mode OR Gemini unavailable
-    if mode == "Scripture only (No AI)" or client is None:
-        if verses:
-            return "📖 **Bible verses related to your question:**\n\n" + "\n\n".join(verses)
-        return "📖 Scripture exists on this topic, but verses could not be clearly extracted."
+    if book and chapter:
+        verses = get_chapter(book, chapter)
+        if not verses:
+            return f"No verses found for {book.title()} {chapter}"
 
-    # Gemini explain mode
-    try:
-        return cached_llm_answer(question, context)
-    except Exception:
-        if verses:
-            return (
-                "⚠️ Gemini unavailable. Showing Scripture instead:\n\n"
-                + "\n\n".join(verses)
-            )
-        return "⚠️ Gemini unavailable and no verses could be extracted."
+        scripture = "\n".join(verses)
 
-# ---------------- STREAMLIT UI ----------------
-st.set_page_config(page_title="Bible Study Assistant", layout="centered")
+        if mode == "Scripture only":
+            return f"📖 **{book.title()} {chapter}**\n\n{scripture}"
 
+        prompt = f"""
+Summarize the following Scripture faithfully:
+
+{scripture}
+"""
+        ai = gemini_answer(prompt)
+        return ai if ai else scripture
+
+    # fallback semantic
+    chunks = semantic_search(question)
+    readable = []
+    for c in chunks:
+        parsed = parse_chunk(c)
+        if parsed:
+            b, ch, v, t = parsed
+            readable.append(f"{b.title()} {ch}:{v} {t}")
+
+    scripture = "\n".join(readable)
+
+    if mode == "Scripture only":
+        return scripture
+
+    prompt = f"""
+Answer the question using Scripture only:
+
+{scripture}
+
+Question: {question}
+"""
+    ai = gemini_answer(prompt)
+    return ai if ai else scripture
+
+# ---------------- UI ----------------
 st.title("📖 Bible Study Assistant")
-st.caption("RAG-based • Bible + Commentary • Gemini 2.5 Flash")
 
 mode = st.radio(
     "Answer mode",
-    ["Explain (Gemini)", "Scripture only (No AI)"],
+    ["Scripture only", "Scripture + Commentary"],
     horizontal=True
 )
 
-if "chat" not in st.session_state:
-    st.session_state.chat = []
-
-question = st.chat_input("Ask a Bible question...")
+question = st.chat_input("Ask a Bible question")
 
 if question:
-    answer = answer_question(question, mode)
-    st.session_state.chat.append(("You", question))
-    st.session_state.chat.append(("BibleBot", answer))
-
-for speaker, text in st.session_state.chat:
-    with st.chat_message("assistant" if speaker == "BibleBot" else "user"):
-        st.write(text)
+    with st.spinner("Searching Scripture..."):
+        response = answer(question, mode)
+    st.chat_message("assistant").write(response)
